@@ -5,4 +5,3 @@ packages:
 optional-packages:
     dependencies/what4/what4
     dependencies/parameterized-utils
-    dependencies/bv-sized
