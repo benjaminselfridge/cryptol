@@ -1,5 +1,7 @@
+{-# LANGUAGE DataKinds #-}
 {-# Language FlexibleContexts #-}
 {-# Language TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 module Cryptol.Eval.Backend
   ( Backend(..)
   , sDelay
@@ -9,7 +11,10 @@ module Cryptol.Eval.Backend
   ) where
 
 import Control.Monad.IO.Class
+import qualified Data.BitVector.Sized as BV
 import Data.Kind (Type)
+import Data.Parameterized.NatRepr
+import GHC.TypeNats
 
 import Cryptol.Eval.Monad
 import Cryptol.TypeCheck.AST(Name)
@@ -41,7 +46,7 @@ sDelay sym msg m =
 --   and symbolic values uniformly.
 class MonadIO (SEval sym) => Backend sym where
   type SBit sym :: Type
-  type SWord sym :: Type
+  type SWord sym :: Nat -> Type
   type SInteger sym :: Type
   type SEval sym :: Type -> Type
 
@@ -85,7 +90,7 @@ class MonadIO (SEval sym) => Backend sym where
   ppBit :: sym -> SBit sym -> Doc
 
   -- | Pretty-print a word value
-  ppWord :: sym -> PPOpts -> SWord sym -> Doc
+  ppWord :: sym -> PPOpts -> SWord sym w -> Doc
 
   -- | Pretty-print an integer value
   ppInteger :: sym -> PPOpts -> SInteger sym -> Doc
@@ -97,15 +102,15 @@ class MonadIO (SEval sym) => Backend sym where
   bitAsLit :: sym -> SBit sym -> Maybe Bool
 
   -- | The number of bits in a word value.
-  wordLen :: sym -> SWord sym -> Integer
+  wordLen :: sym -> SWord sym w -> NatRepr w
 
   -- | Determine if this symbolic word is a literal.
   --   If so, return the bit width and value.
-  wordAsLit :: sym -> SWord sym -> Maybe (Integer, Integer)
+  wordAsLit :: sym -> SWord sym w -> Maybe (NatRepr w, BV.BV w)
 
   -- | Attempt to render a word value as an ASCII character.  Return 'Nothing'
   --   if the character value is unknown (e.g., for symbolic values).
-  wordAsChar :: sym -> SWord sym -> Maybe Char
+  wordAsChar :: sym -> SWord sym w -> Maybe Char
 
   -- | Determine if this symbolic integer is a literal
   integerAsLit :: sym -> SInteger sym -> Maybe Integer
@@ -118,9 +123,9 @@ class MonadIO (SEval sym) => Backend sym where
   -- | Construct a literal word value given a bit width and a value.
   wordLit ::
     sym ->
-    Integer {- ^ Width -} ->
-    Integer {- ^ Value -} ->
-    SEval sym (SWord sym)
+    NatRepr w {- ^ Width -} ->
+    BV.BV w   {- ^ Value -} ->
+    SEval sym (SWord sym w)
 
   -- | Construct a literal integer value from the given integer.
   integerLit ::
@@ -130,7 +135,7 @@ class MonadIO (SEval sym) => Backend sym where
 
   -- ==== If/then/else operations ====
   iteBit :: sym -> SBit sym -> SBit sym -> SBit sym -> SEval sym (SBit sym)
-  iteWord :: sym -> SBit sym -> SWord sym -> SWord sym -> SEval sym (SWord sym)
+  iteWord :: sym -> SBit sym -> SWord sym w -> SWord sym w -> SEval sym (SWord sym w)
   iteInteger :: sym -> SBit sym -> SInteger sym -> SInteger sym -> SEval sym (SInteger sym)
 
 
@@ -148,22 +153,22 @@ class MonadIO (SEval sym) => Backend sym where
   --
   --   NOTE: this assumes that the sequence of bits is big-endian and finite, so the
   --   bit numbered 0 is the most significant bit.
-  wordBit ::
+  wordBit :: w' + 1 <= w =>
     sym ->
-    SWord sym ->
-    Integer {- ^ Bit position to extract -} ->
+    SWord sym w ->
+    NatRepr w' {- ^ Bit position to extract -} ->
     SEval sym (SBit sym)
 
   -- | Update the numbered bit in the word.
   --
   --   NOTE: this assumes that the sequence of bits is big-endian and finite, so the
   --   bit numbered 0 is the most significant bit.
-  wordUpdate ::
+  wordUpdate :: w' + 1 <= w =>
     sym ->
-    SWord sym ->
-    Integer {- ^ Bit position to update -} ->
+    SWord sym w ->
+    NatRepr w' {- ^ Bit position to update -} ->
     SBit sym ->
-    SEval sym (SWord sym)
+    SEval sym (SWord sym w)
 
   -- | Construct a word value from a finite sequence of bits.
   --   NOTE: this assumes that the sequence of bits is big-endian and finite, so the
@@ -171,30 +176,30 @@ class MonadIO (SEval sym) => Backend sym where
   packWord ::
     sym ->
     [SBit sym] ->
-    SEval sym (SWord sym)
+    SEval sym (Some (SWord sym))
 
   -- | Deconstruct a packed word value in to a finite sequence of bits.
   --   NOTE: this produces a list of bits that represent a big-endian word, so
   --   the most significant bit is the first element of the list.
   unpackWord ::
     sym ->
-    SWord sym ->
+    SWord sym w ->
     SEval sym [SBit sym]
 
   -- | Construct a packed word of the specified width from an integer value.
   wordFromInt ::
     sym ->
-    Integer {- ^ bit-width -} ->
+    NatRepr w {- ^ bit-width -} ->
     SInteger sym ->
-    SEval sym (SWord sym)
+    SEval sym (SWord sym w)
 
   -- | Concatenate the two given word values.
   --   NOTE: the first argument represents the more-significant bits
   joinWord ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w' ->
+    SEval sym (SWord sym (w+w'))
 
   -- | Take the most-significant bits, and return
   --   those bits and the remainder.  The first element
@@ -202,10 +207,10 @@ class MonadIO (SEval sym) => Backend sym where
   --   The two integer sizes must sum to the length of the given word value.
   splitWord ::
     sym ->
-    Integer {- ^ left width -} ->
-    Integer {- ^ right width -} ->
-    SWord sym ->
-    SEval sym (SWord sym, SWord sym)
+    NatRepr w  {- ^ left width -} ->
+    NatRepr w' {- ^ right width -} ->
+    SWord sym (w+w') ->
+    SEval sym (SWord sym w, SWord sym w')
 
   -- | Extract a subsequence of bits from a packed word value.
   --   The first integer argument is the number of bits in the
@@ -214,154 +219,154 @@ class MonadIO (SEval sym) => Backend sym where
   --   way, the operation @extractWord n i w@ is equivalent to
   --   first shifting @w@ right by @i@ bits, and then truncating to
   --   @n@ bits.
-  extractWord ::
+  extractWord :: ix + w' <= w =>
     sym ->
-    Integer {- ^ Number of bits to take -} ->
-    Integer {- ^ starting bit -} ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    NatRepr w' {- ^ Number of bits to take -} ->
+    NatRepr ix {- ^ starting bit -} ->
+    SWord sym w ->
+    SEval sym (SWord sym w')
 
   -- | Bitwise OR
   wordOr ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | Bitwise AND
   wordAnd ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | Bitwise XOR
   wordXor ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | Bitwise complement
   wordComplement ::
     sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement addition of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width. Overflow is silently
   --   discarded.
   wordPlus ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement subtraction of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width. Overflow is silently
   --   discarded.
   wordMinus ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement multiplication of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width. The high bits of the
   --   multiplication are silently discarded.
   wordMult ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement unsigned division of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width.  It is illegal to
   --   call with a second argument concretely equal to 0.
   wordDiv ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement unsigned modulus of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width.  It is illegal to
   --   call with a second argument concretely equal to 0.
   wordMod ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement signed division of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width.  It is illegal to
   --   call with a second argument concretely equal to 0.
   wordSignedDiv ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement signed modulus of packed words.  The arguments must have
   --   equal bit width, and the result is of the same width.  It is illegal to
   --   call with a second argument concretely equal to 0.
   wordSignedMod ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | Exponentiation of bitvectors.
   wordExp ::
     sym ->
-    SWord sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | 2's complement negation of bitvectors
   wordNegate ::
     sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | Compute rounded-up log-2 of the input
   wordLg2 ::
     sym ->
-    SWord sym ->
-    SEval sym (SWord sym)
+    SWord sym w ->
+    SEval sym (SWord sym w)
 
   -- | Test if two words are equal.  Arguments must have the same width.
   wordEq ::
     sym ->
-    SWord sym ->
-    SWord sym ->
+    SWord sym w ->
+    SWord sym w ->
     SEval sym (SBit sym)
 
   -- | Signed less-than comparison on words.  Arguments must have the same width.
   wordSignedLessThan ::
     sym ->
-    SWord sym ->
-    SWord sym ->
+    SWord sym w ->
+    SWord sym w ->
     SEval sym (SBit sym)
 
   -- | Unsigned less-than comparison on words.  Arguments must have the same width.
   wordLessThan ::
     sym ->
-    SWord sym ->
-    SWord sym ->
+    SWord sym w ->
+    SWord sym w ->
     SEval sym (SBit sym)
 
   -- | Unsigned greater-than comparison on words.  Arguments must have the same width.
   wordGreaterThan ::
     sym ->
-    SWord sym ->
-    SWord sym ->
+    SWord sym w ->
+    SWord sym w ->
     SEval sym (SBit sym)
 
   -- | Construct an integer value from the given packed word.
   wordToInt ::
     sym ->
-    SWord sym ->
+    SWord sym w ->
     SEval sym (SInteger sym)
 
   -- ==== Integer operations ====
