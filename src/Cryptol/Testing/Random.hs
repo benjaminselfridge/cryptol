@@ -18,9 +18,12 @@ module Cryptol.Testing.Random where
 import qualified Control.Exception as X
 import Control.Monad          (join, liftM2)
 import Data.Bits              ( (.&.), shiftR )
+import qualified Data.BitVector.Sized as BV
 import Data.List              (unfoldr, genericTake, genericIndex, genericReplicate)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Parameterized.NatRepr
+import Data.Parameterized.Some
 import qualified Data.Sequence as Seq
 
 import System.Random          (RandomGen, split, random, randomR)
@@ -383,8 +386,10 @@ typeValues ty =
             _ -> []
         TCSeq       ->
           case map tNoUser ts of
-            [ TCon (TC (TCNum n)) _, TCon (TC TCBit) [] ] ->
-              [ VWord n (ready (WordVal (BV n x))) | x <- [ 0 .. 2^n - 1 ] ]
+            [ TCon (TC (TCNum ni)) _, TCon (TC TCBit) [] ] | Just (Some n) <- someNat ni ->
+              [ VWord ni (ready (WordVal (BV n x)))
+              | x <- BV.enumFromToUnsigned (BV.zero n) (BV.maxUnsigned n)
+              ]
 
             [ TCon (TC (TCNum n)) _, t ] ->
               [ VSeq n (finiteSeqMap Concrete (map ready xs))

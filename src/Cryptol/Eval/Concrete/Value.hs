@@ -7,14 +7,18 @@
 -- Portability :  portable
 
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE Safe #-}
+-- {-# LANGUAGE Safe #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ViewPatterns #-}
 module Cryptol.Eval.Concrete.Value
@@ -23,10 +27,7 @@ module Cryptol.Eval.Concrete.Value
   , unaryBV
   , bvVal
   , ppBV
-  , mkBv
   , mask
-  , signedBV
-  , signedValue
   , integerToChar
   , lg2
   , Value
@@ -37,6 +38,10 @@ module Cryptol.Eval.Concrete.Value
 
 import qualified Control.Exception as X
 import Data.Bits
+import qualified Data.BitVector.Sized as BV
+import Data.Parameterized.NatRepr
+import Data.Parameterized.Pair
+import Data.Parameterized.Some
 import Numeric (showIntAtBase)
 
 import qualified Cryptol.Eval.Arch as Arch
@@ -52,36 +57,50 @@ type Value = GenValue Concrete
 
 -- | Concrete bitvector values: width, value
 -- Invariant: The value must be within the range 0 .. 2^width-1
-data BV = BV !Integer !Integer
+data BV = forall w . BV !(NatRepr w) !(BV.BV w)
 
 instance Show BV where
   show = show . bvVal
 
--- | Apply an integer function to the values of bitvectors.
---   This function assumes both bitvectors are the same width.
-binBV :: Applicative m => (Integer -> Integer -> Integer) -> BV -> BV -> m BV
-binBV f (BV w x) (BV _ y) = pure $! mkBv w (f x y)
-{-# INLINE binBV #-}
+binBV :: Applicative m
+      => String
+      -> (forall w . NatRepr w -> BV.BV w -> BV.BV w -> BV.BV w)
+      -> BV -> BV -> m BV
+binBV fName f (BV w x) (BV w' y)
+  | Just Refl <- w `testEquality` w' = pure $! BV w (f w x y)
+  | otherwise = panic ("Called " ++ fName ++ " on words of different sizes")
+                [show w, show w']
 
--- | Apply an integer function to the values of a bitvector.
---   This function assumes the function will not require masking.
-unaryBV :: (Integer -> Integer) -> BV -> BV
-unaryBV f (BV w x) = mkBv w $! f x
-{-# INLINE unaryBV #-}
+unaryBV :: Applicative m
+     => (forall w . NatRepr w -> BV.BV w -> BV.BV w)
+     -> BV -> m BV
+unaryBV f (BV w x) = pure $! BV w (f w x)
+
+-- -- | Apply an integer function to the values of bitvectors.
+-- --   This function assumes both bitvectors are the same width.
+-- binBV :: Applicative m => (Integer -> Integer -> Integer) -> BV -> BV -> m BV
+-- binBV f (BV w x) (BV _ y) = pure $! mkBv w (f x y)
+-- {-# INLINE binBV #-}
+
+-- -- | Apply an integer function to the values of a bitvector.
+-- --   This function assumes the function will not require masking.
+-- unaryBV :: (Integer -> Integer) -> BV -> BV
+-- unaryBV f (BV w x) = mkBv w $! f x
+-- {-# INLINE unaryBV #-}
 
 bvVal :: BV -> Integer
-bvVal (BV _w x) = x
+bvVal (BV _w x) = BV.asUnsigned x
 {-# INLINE bvVal #-}
 
--- | Smart constructor for 'BV's that checks for the width limit
-mkBv :: Integer -> Integer -> BV
-mkBv w i = BV w (mask w i)
+-- -- | Smart constructor for 'BV's that checks for the width limit
+-- mkBv :: Integer -> Integer -> BV
+-- mkBv w i = BV w (mask w i)
 
-signedBV :: BV -> Integer
-signedBV (BV i x) = signedValue i x
+-- signedBV :: BV -> Integer
+-- signedBV (BV i x) = signedValue i x
 
-signedValue :: Integer -> Integer -> Integer
-signedValue i x = if testBit x (fromInteger (i-1)) then x - (1 `shiftL` (fromInteger i)) else x
+-- signedValue :: Integer -> Integer -> Integer
+-- signedValue i x = if testBit x (fromInteger (i-1)) then x - (1 `shiftL` (fromInteger i)) else x
 
 integerToChar :: Integer -> Char
 integerToChar = toEnum . fromInteger
@@ -94,7 +113,7 @@ lg2 i = case genLog i 2 of
 
 
 ppBV :: PPOpts -> BV -> Doc
-ppBV opts (BV width i)
+ppBV opts (BV (intValue -> width) (BV.BV i))
   | base > 36 = integer i -- not sure how to rule this out
   | asciiMode opts width = text (show (toEnum (fromInteger i) :: Char))
   | otherwise = prefix <.> text value
@@ -139,13 +158,18 @@ instance Backend Concrete where
   assertSideCondition _ True _ = return ()
   assertSideCondition _ False err = io (X.throwIO err)
 
-  wordLen _ (BV w _) = w
-  wordAsChar _ (BV _ x) = Just $! integerToChar x
+  wordLen _ (BV w _) = intValue w
+  wordAsChar _ (BV _ x) = Just $! integerToChar (BV.asUnsigned x)
 
-  wordBit _ (BV w x) idx = pure $! testBit x (fromInteger (w - 1 - idx))
+  wordBit _ (BV w x) idx = pure $! BV.testBit' (fromInteger (intValue w - 1 - idx)) x
 
-  wordUpdate _ (BV w x) idx True  = pure $! BV w (setBit   x (fromInteger (w - 1 - idx)))
-  wordUpdate _ (BV w x) idx False = pure $! BV w (clearBit x (fromInteger (w - 1 - idx)))
+  wordUpdate _ (BV w x) idx b
+    | Just (Some i) <- someNat (intValue w - 1 - idx)
+    , NatCaseLT LeqProof <- testNatCases i w = if b
+                                               then pure $! BV w (BV.setBit i x)
+                                               else pure $! BV w (BV.clearBit w i x)
+    | otherwise = panic "Called wordUpdate on incompatible width and index"
+                  [show w, show idx]
 
   isReady _ (Ready _) = True
   isReady _ _ = False
@@ -178,119 +202,111 @@ instance Backend Concrete where
   iteWord _ b x y = pure $! if b then x else y
   iteInteger _ b x y = pure $! if b then x else y
 
-  wordLit _ w i = pure $! mkBv w i
-  wordAsLit _ (BV w i) = Just (w,i)
+  wordLit _ iw i = case mkNatRepr (fromInteger iw) of
+    Some w -> pure $! BV w (BV.mkBV w i)
+  wordAsLit _ (BV w i) = Just (intValue w, BV.asUnsigned i)
   integerLit _ i = pure i
   integerAsLit _ = Just
 
-  wordToInt _ (BV _ x) = pure x
-  wordFromInt _ w x = pure $! mkBv w x
+  wordToInt _ (BV _ x) = pure (BV.asUnsigned x)
+  wordFromInt _ iw x = case mkNatRepr (fromInteger iw) of
+    Some w -> pure $! BV w (BV.mkBV w x)
 
-  packWord _ bits = pure $! BV (toInteger w) a
-    where
-      w = case length bits of
-            len | toInteger len >= Arch.maxBigIntWidth -> wordTooWide (toInteger len)
-                | otherwise                  -> len
-      a = foldl setb 0 (zip [w - 1, w - 2 .. 0] bits)
-      setb acc (n,b) | b         = setBit acc n
-                     | otherwise = acc
+  packWord _ bits = case BV.bitsBE bits of
+    Pair w bv -> pure $! BV w bv
 
-  unpackWord _ (BV w a) = pure [ testBit a n | n <- [w' - 1, w' - 2 .. 0] ]
-    where
-      w' = fromInteger w
+  unpackWord _ (BV w bv) = pure $ BV.asBitsBE w bv
 
-  joinWord _ (BV i x) (BV j y) =
-    pure $! BV (i + j) (shiftL x (fromInteger j) + y)
+  joinWord _ (BV i x) (BV j y) = pure $! BV (i `addNat` j) (BV.concat i j x y)
 
-  splitWord _ leftW rightW (BV _ x) =
-    pure ( BV leftW (x `shiftR` (fromInteger rightW)), mkBv rightW x )
+  splitWord _ leftW rightW (BV w x) = case (someNat leftW, someNat rightW) of
+    (Just (Some lw), Just (Some rw))
+      | Just LeqProof <- lw `testLeq` w
+      , Just LeqProof <- rw `testLeq` w
+      , Just LeqProof <- (rw `addNat` lw) `testLeq` w
+      , Just Refl <- (lw `addNat` rw) `testEquality` w -> do
+          let lx = BV.select rw lw x
+              rx = BV.select (knownNat @0) rw x
+          pure (BV lw lx, BV rw rx)
+    _ -> panic "Attempt to split word into incompatible subword sizes: splitWord"
+         ["Left: " ++ show leftW, "Right: " ++ show rightW, "Total: " ++ show w]
 
-  extractWord _ n i (BV _ x) = pure $! mkBv n (x `shiftR` (fromInteger i))
-
+  extractWord _ n i (BV w x) = case (someNat n, someNat i) of
+    (Just (Some nw), Just (Some iw)) | Just LeqProof <- (iw `addNat` nw) `testLeq` w ->
+                                       pure $ BV nw (BV.select iw nw x)
+    _ -> panic "Attempt to extract from word with incompatible index and width: extractWord"
+         ["Index: " ++ show i, "Extract: " ++ show n, "From: " ++ show w]
+    
   wordEq _ (BV i x) (BV j y)
-    | i == j = pure $! x == y
+    | Just Refl <- i `testEquality` j = pure $! x == y
     | otherwise = panic "Attempt to compare words of different sizes: wordEq" [show i, show j]
 
   wordSignedLessThan _ (BV i x) (BV j y)
-    | i == j = pure $! signedValue i x < signedValue i y
-    | otherwise = panic "Attempt to compare words of different sizes: wordSignedLessThan" [show i, show j]
+    | Just Refl <- i `testEquality` j
+    , Right LeqProof <- isZeroOrGT1 i = pure $! BV.slt i x y
+    | otherwise = panic "Attempt to compare words of different or illegal sizes: wordSignedLessThan" [show i, show j]
 
   wordLessThan _ (BV i x) (BV j y)
-    | i == j = pure $! x < y
+    | Just Refl <- i `testEquality` j = pure $! BV.ult x y
     | otherwise = panic "Attempt to compare words of different sizes: wordLessThan" [show i, show j]
 
   wordGreaterThan _ (BV i x) (BV j y)
-    | i == j = pure $! x > y
+    | Just Refl <- i `testEquality` j = pure $! BV.ult y x
     | otherwise = panic "Attempt to compare words of different sizes: wordGreaterThan" [show i, show j]
 
-  wordAnd _ (BV i x) (BV j y)
-    | i == j = pure $! mkBv i (x .&. y)
-    | otherwise = panic "Attempt to AND words of different sizes: wordPlus" [show i, show j]
+  wordAnd _ = binBV "wordAnd" (const BV.and)
 
-  wordOr _ (BV i x) (BV j y)
-    | i == j = pure $! mkBv i (x .|. y)
-    | otherwise = panic "Attempt to OR words of different sizes: wordPlus" [show i, show j]
+  wordOr _ = binBV "wordOr" (const BV.or)
 
-  wordXor _ (BV i x) (BV j y)
-    | i == j = pure $! mkBv i (x `xor` y)
-    | otherwise = panic "Attempt to XOR words of different sizes: wordPlus" [show i, show j]
+  wordXor _ = binBV "wordXor" (const BV.xor)
 
-  wordComplement _ (BV i x) = pure $! mkBv i (complement x)
+  wordComplement _ = unaryBV BV.complement
 
-  wordPlus _ (BV i x) (BV j y)
-    | i == j = pure $! mkBv i (x+y)
-    | otherwise = panic "Attempt to add words of different sizes: wordPlus" [show i, show j]
+  wordPlus _ = binBV "wordPlus" BV.add
 
-  wordNegate _ (BV i x) = pure $! mkBv i (negate x)
+  wordNegate _ = unaryBV BV.negate
 
-  wordMinus _ (BV i x) (BV j y)
-    | i == j = pure $! mkBv i (x-y)
-    | otherwise = panic "Attempt to subtract words of different sizes: wordMinus" [show i, show j]
+  wordMinus _ = binBV "wordMinus" BV.sub
 
-  wordMult _ (BV i x) (BV j y)
-    | i == j = pure $! mkBv i (x*y)
-    | otherwise = panic "Attempt to multiply words of different sizes: wordMult" [show i, show j]
+  wordMult _ = binBV "wordMult" BV.mul
 
   wordDiv sym (BV i x) (BV j y)
-    | i == 0 && j == 0 = pure $! mkBv 0 0
-    | i == j =
-        do assertSideCondition sym (y /= 0) DivideByZero
-           pure $! mkBv i (x `div` y)
-    | otherwise = panic "Attempt to divide words of different sizes: wordDiv" [show i, show j]
-
+    | Just Refl <- i `testEquality` j = case isZeroOrGT1 i of
+        Left Refl -> pure $! BV i (BV.zero i)
+        Right LeqProof  -> do assertSideCondition sym (y /= BV.zero i) DivideByZero
+                              pure $! BV i (BV.uquot x y)
+    | otherwise = panic "Called wordDiv on words on different sizes:" [show i, show j]
+  
   wordMod sym (BV i x) (BV j y)
-    | i == 0 && j == 0 = pure $! mkBv 0 0
-    | i == j =
-        do assertSideCondition sym (y /= 0) DivideByZero
-           pure $! mkBv i (x `mod` y)
-    | otherwise = panic "Attempt to mod words of different sizes: wordMod" [show i, show j]
+    | Just Refl <- i `testEquality` j = case isZeroOrGT1 i of
+        Left Refl -> pure $! BV i (BV.zero i)
+        Right LeqProof -> do assertSideCondition sym (y /= BV.zero i) DivideByZero
+                             pure $! BV i (BV.urem x y)
+    | otherwise = panic "Called wordMod on words on different sizes:" [show i, show j]
 
   wordSignedDiv sym (BV i x) (BV j y)
-    | i == 0 && j == 0 = pure $! mkBv 0 0
-    | i == j =
-        do assertSideCondition sym (y /= 0) DivideByZero
-           let sx = signedValue i x
-               sy = signedValue i y
-           pure $! mkBv i (sx `quot` sy)
-    | otherwise = panic "Attempt to divide words of different sizes: wordSignedDiv" [show i, show j]
-
+    | Just Refl <- i `testEquality` j = case isZeroOrGT1 i of
+        Left Refl -> pure $! BV i (BV.zero i)
+        Right LeqProof -> do assertSideCondition sym (y /= BV.zero i) DivideByZero
+                             pure $! BV i (BV.squot i x y)
+    | otherwise = panic "Called wordSignedDiv on words on different sizes:" [show i, show j]
+  
   wordSignedMod sym (BV i x) (BV j y)
-    | i == 0 && j == 0 = pure $! mkBv 0 0
-    | i == j =
-        do assertSideCondition sym (y /= 0) DivideByZero
-           let sx = signedValue i x
-               sy = signedValue i y
-           pure $! mkBv i (sx `rem` sy)
-    | otherwise = panic "Attempt to mod words of different sizes: wordSignedMod" [show i, show j]
+    | Just Refl <- i `testEquality` j = case isZeroOrGT1 i of
+        Left Refl -> pure $! BV i (BV.zero i)
+        Right LeqProof -> do assertSideCondition sym (y /= BV.zero i) DivideByZero
+                             pure $! BV i (BV.srem i x y)
+    | otherwise = panic "Called wordSignedMod on words on different sizes:" [show i, show j]
 
   wordExp _ (BV i x) (BV j y)
-    | i == 0 && j == 0 = pure $! mkBv 0 0
-    | i == j =
-        do let modulus = 0 `setBit` fromInteger i
-           pure . mkBv i $! doubleAndAdd x y modulus
+    | Just Refl <- i `testEquality` j = case isZeroOrGT1 i of
+        Left Refl -> pure $! BV i (BV.zero i)
+        Right LeqProof -> do let modulus = 0 `setBit` widthVal i
+                             pure . BV i . BV.mkBV i $! doubleAndAdd (BV.asUnsigned x) (BV.asUnsigned y) modulus
     | otherwise = panic "Attempt to exp words of different sizes: wordSignedMod" [show i, show j]
+    
 
-  wordLg2 _ (BV i x) = pure $! mkBv i (lg2 x)
+  wordLg2 _ (BV i x) = pure $! BV i $ BV.mkBV i $ lg2 (BV.asUnsigned x)
 
   intEq _ x y = pure $! x == y
   intLessThan _ x y = pure $! x < y

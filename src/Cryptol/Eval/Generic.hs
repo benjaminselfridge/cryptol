@@ -7,7 +7,7 @@
 -- Portability :  portable
 
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE Safe #-}
+-- {-# LANGUAGE Safe #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards #-}
