@@ -6,4 +6,4 @@
 	url = https://github.com/GaloisInc/what4.git
 [submodule "dependencies/parameterized-utils"]
 	path = dependencies/parameterized-utils
-	url = git@github.com:/GaloisInc/parameterized-utils.git
+	url = https://github.com/GaloisInc/parameterized-utils.git
